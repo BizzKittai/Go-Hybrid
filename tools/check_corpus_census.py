@@ -143,6 +143,59 @@ def check_breakdown(root: Path, total: int, counts: Counter) -> list[str]:
     return problems
 
 
+def check_guarantees_breakdown(root: Path, counts: Counter) -> list[str]:
+    """Validate every explicitly current census, not dated historical evidence."""
+    rel = "GUARANTEES.md"
+    path = root / rel
+    if not path.exists():
+        return [f"{rel}: missing (the current verdict breakdown)"]
+    text = path.read_text(encoding="utf-8")
+    inventories = list(re.finditer(
+        r"^## Evidence inventory(?:[ \t][^\r\n]*)?\r?\n(.*?)(?=^#{1,2}[ \t]+|\Z)",
+        text,
+        re.M | re.S,
+    ))
+    if not inventories:
+        return [f"{rel}: no evidence-inventory section found — update this guard"]
+    if len(inventories) != 1:
+        return [f"{rel}: multiple evidence-inventory sections found — current census is ambiguous"]
+    # Historical sections may quote the old wording verbatim; only this
+    # explicitly current inventory is a claim about today's fixture headers.
+    text = inventories[0].group(1)
+    declarations = list(re.finditer(r"\bCurrent census:", text))
+    if not declarations:
+        return [f"{rel}: no current verdict breakdown found — update this guard"]
+
+    expected = {verdict: counts[verdict] for verdict in ("REJECT", "ACCEPT", "ACCEPT-MANAGED")}
+    problems: list[str] = []
+    for declaration in declarations:
+        # Do not borrow a later paragraph's bold text when this claim is broken.
+        paragraph = re.split(r"\r?\n[ \t]*\r?\n", text[declaration.end():], maxsplit=1)[0]
+        body = re.match(r"\s*\*\*([^*]*)\*\*", paragraph)
+        claimed: dict[str, int] = {}
+        if body:
+            for item in body.group(1).split("/"):
+                field = re.fullmatch(r"\s*(\d+)\s+(ACCEPT-MANAGED|ACCEPT|REJECT)\s*", item)
+                if not field or field.group(2) in claimed:
+                    break
+                claimed[field.group(2)] = int(field.group(1))
+            else:
+                if claimed.keys() == expected.keys():
+                    if claimed != expected:
+                        problems.append(
+                            f"{rel}: breakdown says ACCEPT {claimed['ACCEPT']} / "
+                            f"ACCEPT-MANAGED {claimed['ACCEPT-MANAGED']} / REJECT {claimed['REJECT']}, "
+                            f"corpus holds ACCEPT {counts['ACCEPT']} / "
+                            f"ACCEPT-MANAGED {counts['ACCEPT-MANAGED']} / REJECT {counts['REJECT']}"
+                        )
+                    continue
+        problems.append(
+            f"{rel}: malformed current verdict breakdown — expected exactly one "
+            f"non-negative count for REJECT, ACCEPT and ACCEPT-MANAGED"
+        )
+    return problems
+
+
 def collect_problems(root: Path) -> tuple[list[str], int, Counter]:
     """Every disagreement with the corpus, plus the derived census."""
     corpus_dir = root / CORPUS_REL
@@ -153,7 +206,11 @@ def collect_problems(root: Path) -> tuple[list[str], int, Counter]:
     if total == 0:
         return ["the corpus is empty; refusing to certify a count"], 0, counts
 
-    problems = check_total_surfaces(root, total) + check_breakdown(root, total, counts)
+    problems = (
+        check_total_surfaces(root, total)
+        + check_breakdown(root, total, counts)
+        + check_guarantees_breakdown(root, counts)
+    )
     no_verdict = counts.get("NO-VERDICT", 0)
     if no_verdict:
         problems.append(
@@ -183,7 +240,7 @@ def main() -> int:
         return 1
 
     print(
-        f"OK: all {len(TOTAL_SURFACES) + 1} corpus census surfaces agree with the "
+        f"OK: all {len(TOTAL_SURFACES) + 2} corpus census surfaces agree with the "
         f"corpus ({total} programs: ACCEPT {counts['ACCEPT']} · "
         f"ACCEPT-MANAGED {counts['ACCEPT-MANAGED']} · REJECT {counts['REJECT']})."
     )

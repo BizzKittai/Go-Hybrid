@@ -33,6 +33,13 @@ def corpus_file(verdict):
     return f"// EXPECTED-VERDICT: {verdict}\nfn main() {{\n}}\n"
 
 
+def guarantees_claim(reject=2, accept=1, managed=0):
+    return (
+        f"Current census: **{reject} REJECT / {accept} ACCEPT / "
+        f"{managed} ACCEPT-MANAGED**, pinned to diagnostic codes.\n"
+    )
+
+
 def consistent_tree(total=3, accept=1, managed=0, reject=2):
     """A tree where every surface carries the true numbers."""
     files = {}
@@ -49,7 +56,9 @@ def consistent_tree(total=3, accept=1, managed=0, reject=2):
     files["README.md"] = f"| x | y | z [checker corpus {total}/{total}](tests/checker-corpus/) |\n"
     files["STATUS.md"] = f"- Phase: something — corpus {total}/{total}, differential FULL\n"
     files["GUARANTEES.md"] = (
+        "## Evidence inventory (what backs the current claims)\n\n"
         f"  {total} programs, each with an `EXPECTED-VERDICT` header. Programs 01–18 were\n"
+        + guarantees_claim(reject, accept, managed)
     )
     files["compiler/crates/hy-syntax/src/ast.rs"] = (
         f"//! Scope: the surface exercised by tests/checker-corpus/*.hy ({total} programs),\n"
@@ -105,7 +114,12 @@ class DriftTests(_ProblemsMixin, unittest.TestCase):
         self.assertIn("says 99", hits[0])
 
     def test_stale_guarantees_line_is_named(self):
-        hits = self._problems_with("GUARANTEES.md", "  99 programs, each with an `EXPECTED-VERDICT` header.\n")
+        hits = self._problems_with(
+            "GUARANTEES.md",
+            "## Evidence inventory (what backs the current claims)\n\n"
+            "  99 programs, each with an `EXPECTED-VERDICT` header.\n"
+            + guarantees_claim(),
+        )
         self.assertEqual(len(hits), 1)
         self.assertIn("says 99", hits[0])
 
@@ -148,6 +162,152 @@ class DriftTests(_ProblemsMixin, unittest.TestCase):
         )
         self.assertEqual(len(hits), 1)
         self.assertIn("says 7 programs", hits[0])
+
+
+class GuaranteesCensusTests(_ProblemsMixin, unittest.TestCase):
+    def _guarantees_problems(self, current):
+        return self._problems_with(
+            "GUARANTEES.md",
+            "## Evidence inventory (what backs the current claims)\n\n"
+            "  3 programs, each with an `EXPECTED-VERDICT` header.\n" + current,
+        )
+
+    def test_each_current_verdict_count_is_checked(self):
+        for wrong in (
+            guarantees_claim(reject=3),
+            guarantees_claim(accept=2),
+            guarantees_claim(managed=1),
+        ):
+            with self.subTest(claim=wrong):
+                hits = self._guarantees_problems(wrong)
+                self.assertEqual(len(hits), 1)
+                self.assertIn("breakdown says", hits[0])
+                self.assertIn("corpus holds", hits[0])
+
+    def test_same_sum_with_the_wrong_distribution_is_rejected(self):
+        hits = self._guarantees_problems(guarantees_claim(reject=1, accept=2))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("breakdown says", hits[0])
+
+    def test_a_stale_repeated_current_census_is_not_ignored(self):
+        hits = self._guarantees_problems(
+            guarantees_claim() + guarantees_claim(reject=1, accept=2)
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("breakdown says", hits[0])
+
+    def test_a_malformed_repeated_current_census_is_not_ignored(self):
+        hits = self._guarantees_problems(
+            guarantees_claim() + "Current census: **two REJECT / 1 ACCEPT / 0 ACCEPT-MANAGED**.\n"
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("malformed current verdict breakdown", hits[0])
+
+    def test_missing_current_census_does_not_use_a_historical_one(self):
+        hits = self._guarantees_problems(
+            "Historical census (2026-10-13): **2 REJECT / 1 ACCEPT / 0 ACCEPT-MANAGED**.\n"
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("no current verdict breakdown found", hits[0])
+
+    def test_invalid_named_groups_fail_closed(self):
+        for body in (
+            "-2 REJECT / 1 ACCEPT / 0 ACCEPT-MANAGED",
+            "2 REJECT / 1 ACCEPT / 0 ACCEPT",
+            "2 REJECT / 1 ACCEPT / 0 UNKNOWN",
+            "2 REJECT / 1 ACCEPT",
+            "2 REJECT / 1 ACCEPT / 0 ACCEPT-MANAGED / 0 UNKNOWN",
+            "2 REJECT / 1 ACCEPT / 0 ACCEPT-MANAGED ignored",
+        ):
+            with self.subTest(body=body):
+                hits = self._guarantees_problems(f"Current census: **{body}**.\n")
+                self.assertEqual(len(hits), 1)
+                self.assertIn("malformed current verdict breakdown", hits[0])
+
+    def test_a_missing_bold_census_does_not_consume_the_next_paragraph(self):
+        hits = self._guarantees_problems(
+            "Current census:\n\n"
+            "Historical census (2026-10-13): **2 REJECT / 1 ACCEPT / 0 ACCEPT-MANAGED**.\n"
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("malformed current verdict breakdown", hits[0])
+
+    def test_reordered_and_wrapped_named_groups_are_accepted(self):
+        hits = self._guarantees_problems(
+            "Current census: **0 ACCEPT-MANAGED /\n  2 REJECT / 1 ACCEPT**.\n"
+        )
+        self.assertEqual(hits, [])
+
+    def test_zero_counts_are_valid_for_each_verdict_group(self):
+        for accept, managed, reject in ((1, 0, 0), (0, 1, 0), (0, 0, 1)):
+            with self.subTest(counts=(accept, managed, reject)):
+                tmp, root = make_tree(
+                    consistent_tree(total=1, accept=accept, managed=managed, reject=reject)
+                )
+                self.addCleanup(tmp.cleanup)
+                problems, _, _ = MOD.collect_problems(root)
+                self.assertEqual(problems, [])
+
+    def test_literal_current_census_in_historical_sections_is_ignored(self):
+        files = consistent_tree()
+        files["GUARANTEES.md"] = (
+            "## Previous verification\n\n"
+            "2026-10-13: Current census: **11 REJECT / 7 ACCEPT / 2 ACCEPT-MANAGED**.\n\n"
+            + files["GUARANTEES.md"]
+            + "\n## Archived verification\n\n"
+            "2026-10-14: Current census: **12 REJECT / 8 ACCEPT / 2 ACCEPT-MANAGED**.\n"
+        )
+        tmp, root = make_tree(files)
+        self.addCleanup(tmp.cleanup)
+        problems, _, _ = MOD.collect_problems(root)
+        self.assertEqual(problems, [])
+
+    def test_historical_matching_counts_cannot_replace_the_current_claim(self):
+        hits = self._guarantees_problems(
+            "The current census is missing.\n\n"
+            "## Previous verification\n\n"
+            "2026-10-13: " + guarantees_claim()
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("no current verdict breakdown found", hits[0])
+
+    def test_missing_evidence_inventory_section_fails_closed(self):
+        hits = self._problems_with(
+            "GUARANTEES.md",
+            "## Previous verification\n\n"
+            "  3 programs, each with an `EXPECTED-VERDICT` header.\n"
+            "2026-10-13: " + guarantees_claim(),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("no evidence-inventory section found", hits[0])
+
+    def test_a_higher_level_heading_also_ends_the_current_inventory(self):
+        files = consistent_tree()
+        files["GUARANTEES.md"] += (
+            "\n# Archived verification\n\n"
+            "2026-10-13: Current census: **11 REJECT / 7 ACCEPT / 2 ACCEPT-MANAGED**.\n"
+        )
+        tmp, root = make_tree(files)
+        self.addCleanup(tmp.cleanup)
+        problems, _, _ = MOD.collect_problems(root)
+        self.assertEqual(problems, [])
+
+    def test_multiple_evidence_inventory_sections_fail_closed(self):
+        hits = self._guarantees_problems(
+            guarantees_claim()
+            + "\n## Evidence inventory (another purported current inventory)\n\n"
+            + guarantees_claim(reject=1, accept=2)
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("multiple evidence-inventory sections found", hits[0])
+
+    def test_dated_historical_results_are_not_current_claims(self):
+        hits = self._guarantees_problems(
+            "Historical census (2026-10-13): **11 REJECT / 7 ACCEPT / 2 ACCEPT-MANAGED**.\n\n"
+            + guarantees_claim()
+            + "\n2026-10-13 differential results: 9/9 accept, 11/11 reject.\n"
+        )
+        self.assertEqual(hits, [])
 
 
 class FailClosedTests(_ProblemsMixin, unittest.TestCase):
